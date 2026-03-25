@@ -4,20 +4,15 @@ import { buildVoiceMessage } from "./voiceMessage.js";
 
 // --- Types ---
 
-interface AnswerExtraction {
-  questionId: string;
-  question: string;
-  answer: string;
-  urgencyConfirmed: boolean;
-  needsSearch: boolean;
-  searchQuery: string | null;
-  searchType: "web" | "news" | "github" | "research" | null;
-  recency: "hour" | "day" | "week" | "any" | null;
-}
-
-interface AnswersResult {
-  answers: AnswerExtraction[];
-  priorityOrder: string[];
+interface SummaryExtraction {
+  priorities: string[];
+  searchJobs: Array<{
+    key: string;
+    query: string;
+    type: "web" | "news" | "github" | "research";
+    recency: "hour" | "day" | "week" | "any";
+    urgent: boolean;
+  }>;
   additionalContext: string;
 }
 
@@ -61,117 +56,96 @@ async function firecrawlSearch(
 }
 
 /**
- * Step 6 — Parse call answers, run research searches, then build VM.
+ * Step 6 — Extract search queries & priorities from the call summary,
+ * run research, then build the voice message.
  */
 export async function buildResearchAndVM(
   sessionId: string,
   sessionData: FirebaseFirestore.DocumentData,
-  callTranscript: string
+  callSummary: string
 ): Promise<void> {
-  const {
-    extractedEntities,
-    clarificationQuestions,
-    transcript: dumpTranscript,
-  } = sessionData;
+  const { extractedEntities, transcript: dumpTranscript } = sessionData;
 
+  console.log("Extracting search intent from call summary", { sessionId });
 
-
-  // Step A: Extract answers from the call transcript
-  console.log("Extracting answers from call transcript", { sessionId });
-
-  const answersExtraction = await openai.chat.completions.create({
+  const extraction = await openai.chat.completions.create({
     model: "gpt-5.1",
     response_format: { type: "json_object" },
     messages: [
       {
         role: "system",
-        content: `
-          You are given a list of questions that were asked in a call,
-          and the full call transcript. 
-          
-          Extract the user's answer to each question.
-          
-          Return JSON:
-          {
-            "answers": [
-              {
-                "questionId": "q1",
-                "question": "string",
-                "answer": "exactly what they said",
-                "urgencyConfirmed": true | false,
-                "needsSearch": true | false,
-                "searchQuery": "string if needsSearch, else null",
-                "searchType": "web | news | github | research | null",
-                "recency": "hour | day | week | any | null"
-              }
-            ],
-            "priorityOrder": ["task description 1", "task description 2", "task description 3"],
-            "additionalContext": "anything else useful the user mentioned during the call"
-          }
-        `,
+        content: `You receive a call summary and the user's original brain dump.
+Extract what needs to be searched and the user's priorities.
+
+Return JSON:
+{
+  "priorities": ["highest priority task", "second", ...],
+  "searchJobs": [
+    {
+      "key": "search_1",
+      "query": "concise search query",
+      "type": "web | news | github | research",
+      "recency": "hour | day | week | any",
+      "urgent": true | false
+    }
+  ],
+  "additionalContext": "anything else useful from the summary"
+}
+
+RULES:
+- Only include searchJobs for things that genuinely need a web/news lookup.
+- Keep queries short and specific — what you'd actually type into a search bar.
+- Priorities should be ordered by how the user ranked them in the call.
+- If nothing needs searching, return an empty searchJobs array.`,
       },
       {
         role: "user",
-        content: `
-          Questions asked: ${JSON.stringify(clarificationQuestions)}
-          
-          Full call transcript: ${JSON.stringify(callTranscript)}
-        `,
+        content: `Call summary: ${callSummary}\n\nOriginal dump: ${dumpTranscript}`,
       },
     ],
   });
 
-  const answersContent = answersExtraction.choices[0].message.content;
-  if (!answersContent) {
-    throw new Error("GPT-4o-mini returned empty answer extraction");
-  }
+  const raw = extraction.choices[0].message.content;
+  if (!raw) throw new Error("Empty extraction from call summary");
 
-  const { answers, priorityOrder, additionalContext } =
-    JSON.parse(answersContent) as AnswersResult;
+  const { priorities, searchJobs, additionalContext } =
+    JSON.parse(raw) as SummaryExtraction;
 
-  // Step B: Build certain searches from people entities
+  // People-entity searches (always run)
   const people = (extractedEntities.people ?? []) as Person[];
-  const certainSearches: SearchJob[] = people.map((p) => ({
-    key: p.id,
+  const peopleSearches: SearchJob[] = people.map((p) => ({
+    key: `person_${p.id}`,
     query: `${p.name} ${p.company ?? ""} news`.trim(),
     sources: ["news", "web"],
     tbs: "qdr:w",
   }));
 
-  // Step C: Build full search job list
-  const allSearchJobs: SearchJob[] = [
-    ...certainSearches,
-    ...answers
-      .filter((a) => a.needsSearch && a.searchQuery)
-      .map((a) => ({
-        key: a.questionId,
-        query: a.searchQuery!,
-        sources: a.searchType === "news" ? ["news"] : ["web"],
-        categories: ["github", "research"].includes(a.searchType ?? "")
-          ? [a.searchType!]
-          : undefined,
-        tbs:
-          ({
-            hour: "qdr:h",
-            day: "qdr:d",
-            week: "qdr:w",
-            any: null,
-          } as Record<string, string | null>)[a.recency ?? "any"] ?? null,
-        limit: 3,
-        scrapeOptions: { formats: ["markdown"] },
-      })),
-  ];
+  const recencyToTbs: Record<string, string | null> = {
+    hour: "qdr:h",
+    day: "qdr:d",
+    week: "qdr:w",
+    any: null,
+  };
 
-  // Step D: Run all searches in parallel via Firecrawl
+  const summarySearches: SearchJob[] = searchJobs.map((j) => ({
+    key: j.key,
+    query: j.query,
+    sources: j.type === "news" ? ["news"] : ["web"],
+    categories: ["github", "research"].includes(j.type) ? [j.type] : undefined,
+    tbs: recencyToTbs[j.recency] ?? null,
+    limit: 3,
+    scrapeOptions: { formats: ["markdown"] },
+  }));
+
+  const allSearchJobs: SearchJob[] = [...peopleSearches, ...summarySearches];
+
   console.log("Running research searches", {
     sessionId,
     jobCount: allSearchJobs.length,
   });
 
-  const apiKey = FIRECRAWL_API_KEY;
-
   const searchResults = await Promise.allSettled(
-    allSearchJobs.map((job) => firecrawlSearch(apiKey, job))
+    allSearchJobs.map((job) => firecrawlSearch(FIRECRAWL_API_KEY, job))
   );
 
   const firecrawlResults: Record<
@@ -186,32 +160,30 @@ export async function buildResearchAndVM(
           .map((item) => ({
             title: item.title,
             url: item.url,
-            content:
-              item.markdown?.slice(0, 500) ?? item.description ?? "",
+            content: item.markdown?.slice(0, 500) ?? item.description ?? "",
           })) ?? [];
     }
   });
 
-  // Save research results
+  const userId = sessionData.userId ?? "unknown";
+
   await db
     .collection("User")
-    .doc(sessionData.userId ?? "unknown")
+    .doc(userId)
     .collection("Sessions")
     .doc(sessionId)
     .update({
       firecrawlResults,
-      answers,
-      priorityOrder,
+      priorities,
       status: "building_vm",
     });
 
   console.log("Research complete, building voice message", { sessionId });
 
-  // Step E: Build the voice message
-  await buildVoiceMessage(sessionId, sessionData.userId ?? "unknown", {
+  await buildVoiceMessage(sessionId, userId, {
     dumpTranscript,
-    answers,
-    priorityOrder,
+    callSummary,
+    priorities,
     additionalContext,
     firecrawlResults,
     entities: extractedEntities,

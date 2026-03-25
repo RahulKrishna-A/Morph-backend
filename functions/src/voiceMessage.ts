@@ -10,12 +10,8 @@ import {
 
 interface VoiceMessageData {
   dumpTranscript: string;
-  answers: Array<{
-    questionId: string;
-    question: string;
-    answer: string;
-  }>;
-  priorityOrder: string[];
+  callSummary: string;
+  priorities: string[];
   additionalContext: string;
   firecrawlResults: Record<
     string,
@@ -40,8 +36,8 @@ export async function buildVoiceMessage(
 ): Promise<void> {
   const {
     dumpTranscript,
-    answers,
-    priorityOrder,
+    callSummary,
+    priorities,
     additionalContext,
     firecrawlResults,
     entities: _entities,
@@ -49,49 +45,42 @@ export async function buildVoiceMessage(
 
   console.log("Building voice message script", { sessionId });
 
-
-
   const scriptRes = await openai.chat.completions.create({
     model: "gpt-5.1",
     messages: [
       {
         role: "system",
-        content: `
-          You are writing a spoken voice note script. 
-          This will be converted directly to audio by a TTS engine.
-          
-          Write it as natural spoken words — NOT bullet points, 
-          NOT headers, NOT markdown. 
-          
-          Structure (in this order):
-          1. Quick open (one sentence, no fluff)
-          2. Top 3 priorities for today — spoken naturally, not listed
-          3. Research findings — ONE useful thing per topic, 
-             name the source casually ("I checked..." / "Saw something interesting...")
-          4. Quick close — 1 sentence, end cleanly
-          
-          RULES:
-          - Max 250 words total — this is a voice note, not a report
-          - No "Great news!" or filler openers
-          - Sound like a person, not an AI
-          - If a search found nothing useful, skip it entirely
-          - Speak priorities in order of what was confirmed in the call
-          - Do not say "According to my research" — just say what you found
-        `,
+        content: `You are writing a spoken voice note script.
+This will be converted directly to audio by a TTS engine.
+
+Write it as natural spoken words — NOT bullet points, NOT headers, NOT markdown.
+
+Structure (in this order):
+1. Quick open (one sentence, no fluff)
+2. Top priorities for today — spoken naturally, not listed
+3. Research findings — ONE useful thing per topic,
+   name the source casually ("I checked..." / "Saw something interesting...")
+4. Quick close — 1 sentence, end cleanly
+
+RULES:
+- Max 250 words total — this is a voice note, not a report
+- No "Great news!" or filler openers
+- Sound like a person, not an AI
+- If a search found nothing useful, skip it entirely
+- Speak priorities in the order given
+- Do not say "According to my research" — just say what you found`,
       },
       {
         role: "user",
-        content: `
-          Original dump: "${dumpTranscript}"
-          
-          Priority order confirmed in call: ${JSON.stringify(priorityOrder)}
-          
-          Answers from clarification call: ${JSON.stringify(answers)}
-          
-          Research found: ${JSON.stringify(firecrawlResults)}
-          
-          Additional context from call: ${additionalContext}
-        `,
+        content: `Original dump: "${dumpTranscript}"
+
+Call summary: ${callSummary}
+
+Priorities (in order): ${JSON.stringify(priorities)}
+
+Research found: ${JSON.stringify(firecrawlResults)}
+
+Additional context: ${additionalContext}`,
       },
     ],
   });
@@ -148,23 +137,20 @@ async function generateVoiceMessage(
     throw new Error(`TTS failed (${ttsRes.status}): ${errText}`);
   }
 
-  // Get audio as buffer
   const audioBuffer = Buffer.from(await ttsRes.arrayBuffer());
 
-  // Upload to Firebase Storage
   const bucket = storage.bucket();
-  const vmPath = `voicemessages/${sessionId}/brief.mp3`;
-  await bucket.file(vmPath).save(audioBuffer, {
+  const fileName = `brief-${Date.now()}.mp3`;
+  const objectPath = `audio/${userId}/${sessionId}/${fileName}`;
+  const file = bucket.file(objectPath);
+
+  await file.save(audioBuffer, {
     metadata: { contentType: "audio/mpeg" },
   });
 
-  // Get signed URL (7 days)
-  const [url] = await bucket.file(vmPath).getSignedUrl({
-    action: "read",
-    expires: Date.now() + 7 * 24 * 60 * 60 * 1000,
-  });
+  await file.makePublic();
+  const publicUrl = `https://storage.googleapis.com/${bucket.name}/${file.name}`;
 
-  // Save everything to Firestore — status: complete triggers the frontend
   const sessionRef = db
     .collection("User")
     .doc(userId)
@@ -172,11 +158,11 @@ async function generateVoiceMessage(
     .doc(sessionId);
 
   await sessionRef.update({
-    vmUrl: url,
+    vmUrl: publicUrl,
     vmScript: script,
     status: "complete",
     completedAt: new Date(),
   });
 
-  console.log("Voice message complete", { sessionId, vmPath });
+  console.log("Voice message complete", { sessionId, objectPath, publicUrl });
 }

@@ -8,7 +8,7 @@ import type { ClarificationQuestion } from "./extract.js";
  */
 function buildCallContext(
   transcript: string,
-  clarificationQuestions: ClarificationQuestion[]
+  clarificationQuestions: ClarificationQuestion[],
 ): string {
   return `
 === WHAT THEY SAID (their morning dump) ===
@@ -76,43 +76,38 @@ export const onAgentCall = onRequest(
 
       const agentContext = buildCallContext(transcript, clarificationQuestions);
 
+
       const apiRes = await fetch(
-        `https://api.elevenlabs.io/v1/convai/conversations/create`,
+        `https://api.elevenlabs.io/v1/convai/conversation/token?agent_id=${ELEVENLABS_AGENT_ID}`,
         {
-          method: "POST",
           headers: {
+            // Requesting a signed url requires your ElevenLabs API key
+            // Do NOT expose your API key to the client!
             "xi-api-key": ELEVENLABS_API_KEY,
-            "Content-Type": "application/json",
           },
-          body: JSON.stringify({
-            agent_id: ELEVENLABS_AGENT_ID,
-            dynamic_variables: {
-              agent_context: agentContext,
-            },
-          }),
-        }
+        },
       );
 
       if (!apiRes.ok) {
         const errText = await apiRes.text();
         throw new Error(
-          `ElevenLabs create conversation failed (${apiRes.status}): ${errText}`
+          `ElevenLabs create conversation failed (${apiRes.status}): ${errText}`,
         );
       }
 
-      const data = (await apiRes.json()) as { conversation_id: string };
+      const data = (await apiRes.json()) as { token: string };
 
       await sessionRef.update({
-        conversationId: data.conversation_id,
+        conversationToken: data.token,
         status: "call_in_progress",
       });
 
       console.log("Agent call initiated", {
         sessionId,
-        conversationId: data.conversation_id,
+        conversationToken: data.token,
       });
 
-      res.json({ conversationId: data.conversation_id });
+      res.json({ conversationToken: data.token, agentContext });
     } catch (error) {
       console.error("Agent call failed", { sessionId, error });
 
@@ -133,5 +128,5 @@ export const onAgentCall = onRequest(
           error instanceof Error ? error.message : "Internal error occurred",
       });
     }
-  }
+  },
 );
