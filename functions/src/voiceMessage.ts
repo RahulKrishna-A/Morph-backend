@@ -13,6 +13,7 @@ interface VoiceMessageData {
   callSummary: string;
   priorities: string[];
   additionalContext: string;
+  researchPlan: Array<{ key: string; query: string }>;
   firecrawlResults: Record<
     string,
     Array<{ title: string; url: string; content: string }>
@@ -23,6 +24,39 @@ interface VoiceMessageData {
     researchTopics: Array<{ topic: string }>;
     emotionalTone: string;
   };
+}
+
+function sourceLabel(url: string): string {
+  try {
+    return new URL(url).hostname.replace(/^www\./, "");
+  } catch {
+    return "source";
+  }
+}
+
+function buildResearchContextBlock(
+  researchPlan: Array<{ key: string; query: string }>,
+  firecrawlResults: Record<string, Array<{ title: string; url: string; content: string }>>
+): string {
+  if (researchPlan.length === 0) {
+    return "No external lookup was required for this session.";
+  }
+
+  const sections = researchPlan.map((item) => {
+    const rows = (firecrawlResults[item.key] ?? []).slice(0, 3);
+    if (rows.length === 0) {
+      return `Query: ${item.query}\nNo strong external signal found.`;
+    }
+
+    const sourceLines = rows.map((row, index) => {
+      const excerpt = row.content.slice(0, 900);
+      return `${index + 1}. ${row.title} (${sourceLabel(row.url)})\n${excerpt}`;
+    });
+
+    return `Query: ${item.query}\n${sourceLines.join("\n\n")}`;
+  });
+
+  return sections.join("\n\n---\n\n");
 }
 
 /**
@@ -39,8 +73,9 @@ export async function buildVoiceMessage(
     callSummary,
     priorities,
     additionalContext,
+    researchPlan,
     firecrawlResults,
-    entities: _entities,
+    entities,
   } = data;
 
   console.log("Building voice message script", { sessionId });
@@ -50,25 +85,48 @@ export async function buildVoiceMessage(
     messages: [
       {
         role: "system",
-        content: `You are writing a spoken voice note script.
-This will be converted directly to audio by a TTS engine.
+        content: `You are writing a personalized spoken daily brief that will be converted directly into TTS audio.
+Your goal is to give the user clarity, focus, and momentum in under about 90 seconds.
 
-Write it as natural spoken words — NOT bullet points, NOT headers, NOT markdown.
+Output format requirements:
+- Return plain text only.
+- No markdown, no bullets, no numbered lists, no headings, no emojis.
+- Write natural spoken prose suitable for text-to-speech.
 
-Structure (in this order):
-1. Quick open (one sentence, no fluff)
-2. Top priorities for today — spoken naturally, not listed
-3. Research findings — ONE useful thing per topic,
-   name the source casually ("I checked..." / "Saw something interesting...")
-4. Quick close — 1 sentence, end cleanly
+Required structure and order:
+1. One-sentence opening that orients the user to today.
+2. Priority guidance: walk through priorities in the exact provided order, naturally in speech.
+3. Research insights: include only high-signal findings tied to current priorities.
+4. One-sentence close that prompts immediate action.
 
-RULES:
-- Max 250 words total — this is a voice note, not a report
-- No "Great news!" or filler openers
-- Sound like a person, not an AI
-- If a search found nothing useful, skip it entirely
-- Speak priorities in the order given
-- Do not say "According to my research" — just say what you found`,
+Voice and style rules:
+- Sound like a trusted chief of staff: calm, direct, practical, encouraging.
+- Use conversational language and contractions when natural.
+- Avoid hype, filler, and generic motivational lines.
+- Do not mention being an AI or doing "research" in abstract terms.
+
+Content rules:
+- Respect the user's emotional context without sounding dramatic.
+- For each priority, include a concrete next step, decision point, or sequencing cue.
+- Use only facts present in provided search results. Never invent facts, names, numbers, dates, or claims.
+- Weave specific details from research findings directly into the brief: names, prices, ratings, locations, hours, comparisons, and other concrete data points the user needs.
+- Mention sources casually when used (for example publication/site names), but never read full URLs.
+- If a result is weak or ambiguous, phrase it with appropriate uncertainty.
+- Skip search items that contain no useful signal.
+- If there are no meaningful findings, briefly acknowledge that and continue with actionable guidance.
+- When research provides multiple options (restaurants, services, products), highlight the top 2-3 with their distinguishing details.
+
+Length and delivery constraints:
+- Target 160 to 220 words.
+- Hard maximum 250 words.
+- Prefer short and medium sentences for clean TTS pacing.
+- Avoid tongue-twister phrasing and dense jargon.
+- End cleanly with a specific forward-moving final sentence.
+
+Final checks before responding:
+- Priorities are in the provided order.
+- Script is fully consistent with inputs.
+- Plain text only with no extra formatting artifacts.`,
       },
       {
         role: "user",
@@ -78,7 +136,10 @@ Call summary: ${callSummary}
 
 Priorities (in order): ${JSON.stringify(priorities)}
 
-Research found: ${JSON.stringify(firecrawlResults)}
+Extracted entities: ${JSON.stringify(entities)}
+
+Research findings by query:
+${buildResearchContextBlock(researchPlan, firecrawlResults)}
 
 Additional context: ${additionalContext}`,
       },
@@ -166,3 +227,4 @@ async function generateVoiceMessage(
 
   console.log("Voice message complete", { sessionId, objectPath, publicUrl });
 }
+
