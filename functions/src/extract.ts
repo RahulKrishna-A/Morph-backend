@@ -9,6 +9,9 @@ export interface Task {
   type: "work" | "personal" | "communication" | "creative" | "research";
   isVague: boolean;
   urgency: "explicit" | "implicit" | "none";
+  needsLocation: boolean;
+  locationHint?: string;
+  actionable: boolean;
 }
 
 export interface Person {
@@ -16,6 +19,8 @@ export interface Person {
   name: string;
   context: string;
   company?: string;
+  wantsToMeet: boolean;
+  meetingContext?: string;
 }
 
 export interface ResearchTopic {
@@ -42,8 +47,10 @@ export interface ExtractionResult {
 // --- Prompt ---
 
 const EXTRACTION_PROMPT = `
-You are a structured extraction engine for a founder's morning brain dump.
-Your job is to convert messy speech into precise entities that power an agent call.
+You are a structured extraction engine for a user's brain dump.
+Your CORE MISSION: convert messy speech into precise, actionable entities AND generate aggressive clarification questions that extract every detail needed for us to research, prioritize, and give the user everything they need to execute.
+
+You must think like a chief of staff who knows that the more specific information we get NOW, the better the research and final brief will be. Every vague mention is an opportunity to ask a sharp follow-up.
 
 Output requirements:
 - Return one valid JSON object only.
@@ -60,7 +67,10 @@ Return this exact schema:
       "cleaned": "clear normalized action statement",
       "type": "work | personal | communication | creative | research",
       "isVague": true,
-      "urgency": "explicit | implicit | none"
+      "urgency": "explicit | implicit | none",
+      "needsLocation": false,
+      "locationHint": "city/area if mentioned, otherwise omit",
+      "actionable": true
     }
   ],
   "people": [
@@ -68,7 +78,9 @@ Return this exact schema:
       "id": "p1",
       "name": "person name as spoken",
       "context": "why this person matters in current tasks",
-      "company": "company/org if clearly stated, otherwise omit this key"
+      "company": "company/org if clearly stated, otherwise omit this key",
+      "wantsToMeet": false,
+      "meetingContext": "what the meeting is about, if mentioned"
     }
   ],
   "researchTopics": [
@@ -83,7 +95,8 @@ Return this exact schema:
       "id": "q1",
       "question": "single sharp question for follow-up call",
       "targetId": "t1 | p1 | r1 | etc",
-      "why": "what decision or search becomes possible after answer"
+      "why": "what decision or search becomes possible after answer",
+      "category": "location | priority | detail | person | deadline | scope"
     }
   ],
   "priorityQuestion": "one forced-tradeoff question between top priorities"
@@ -111,16 +124,48 @@ Entity extraction rules:
   - overwhelmed: too many competing priorities and capacity stress
   - clear: focused, ordered, and calm
 
-Clarification question rules:
-- Generate 0 to 3 clarificationQuestions. priorityQuestion is separate.
-- Ask only high-leverage questions whose answers materially change:
-  - what to research,
-  - what to do first,
-  - or how to execute.
-- Do not ask for details that are already clear in the transcript.
+Location awareness rules (CRITICAL):
+- needsLocation = true for ANY task that involves going somewhere, finding a service, buying something physically, meeting someone, getting something repaired/serviced, visiting a place, dining, traveling, or any real-world action.
+- Examples: "get keyboard repaired" → needsLocation=true; "find a good gym" → needsLocation=true; "meet John for coffee" → needsLocation=true; "book flights to NYC" → needsLocation=true; "get groceries" → needsLocation=true.
+- locationHint: extract any geographic info mentioned (city, neighborhood, area, "near office", etc). Omit if nothing stated.
+- actionable = true when the task can be immediately acted upon with enough info. false when key blockers remain.
+- For EVERY task where needsLocation=true and locationHint is missing, you MUST generate a clarification question asking WHERE.
+
+People and meeting intelligence rules (CRITICAL):
+- wantsToMeet = true if the user mentions wanting to meet, catch up with, have coffee with, visit, or see this person.
+- meetingContext: capture why the meeting matters, what to discuss, relationship context.
+- For EVERY person where wantsToMeet=true, generate a researchTopic for that person (their latest work, company news, social profiles, recent activity) so we can brief the user before the meeting.
+- If the user mentions wanting to meet someone, generate ONE clarification question that covers the most critical missing detail (when, where, or what to prepare — pick the single most impactful one, not all three).
+
+Clarification question rules (SHARP AND FOCUSED):
+- Generate 3 to 6 clarificationQuestions. priorityQuestion is separate.
+- Each question must be SELF-CONTAINED and ask for exactly ONE piece of information. Do not combine multiple asks into one question.
+- The agent will ask each question and get AT MOST one follow-up per question, so every question must be designed to get a useful answer in one shot.
+- Your goal is to cover the most important gaps. Ask about:
+  1. LOCATION: "Where do you want to find [service/place]?" for any location-dependent task
+  2. PRIORITY: "Which of these matters more to you today: X or Y?"
+  3. DETAIL: "What's your budget/timeline/preference for X?"
+  4. PERSON: "When do you want to meet [person]?" (single ask, not a compound question)
+  5. DEADLINE: "When does X need to be done by?"
+  6. SCOPE: "What exactly do you need from X — the full thing or just Y?"
+- category field must be one of: location, priority, detail, person, deadline, scope
+- Do not ask for details already clear in the transcript.
 - Prefer concrete choice or constraint questions over open-ended prompts.
 - Each clarification question must reference a valid existing targetId.
-- Keep each clarification question under 24 words.
+- Keep each clarification question under 20 words. Shorter = better answer.
+- NEVER combine two questions into one (e.g., "When and where do you want to meet him?" is BAD — split into two separate questions or pick the more important one).
+- ALWAYS ask at least one location question if any task involves the real world.
+- ALWAYS ask at least one priority/deadline question to understand what matters most.
+- Think about what information would help us do the BEST possible web research and give the user the most useful brief.
+
+Research topic generation rules (BE THOROUGH):
+- Generate researchTopics for ANYTHING that would benefit from web lookup.
+- If someone mentions a person → research that person's latest activity.
+- If someone mentions a product/service → research best options, reviews, prices.
+- If someone mentions a place/event → research details, logistics, recommendations.
+- If someone mentions a company → research latest news, updates.
+- If someone mentions a problem → research solutions, services, providers.
+- Be liberal: when in doubt, ADD a research topic. More research = better brief.
 
 Priority question rules:
 - Always produce exactly one priorityQuestion.
@@ -131,6 +176,8 @@ Priority question rules:
 Quality checks before output:
 - IDs are sequential per section: t1.., p1.., r1.., q1...
 - Avoid duplicate tasks, people, topics, and questions.
+- Every needsLocation=true task without a locationHint has a matching location clarification question.
+- Every wantsToMeet=true person has at least one research topic and one clarification question.
 - Ensure JSON parses without repair.
 `;
 

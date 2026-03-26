@@ -35,7 +35,11 @@ export const sessionWebhook = onRequest(
   {
     timeoutSeconds: 540,
     memory: "1GiB",
-    cors: true,
+    cors: [
+      "http://localhost:3000",
+      "http://localhost:3001",
+      /https:\/\/(.*\.)?morphs\.life$/,
+    ],
   },
   async (req, res) => {
     if (req.method !== "POST") {

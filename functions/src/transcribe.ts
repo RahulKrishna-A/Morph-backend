@@ -38,6 +38,7 @@ export async function transcribeAudio(audioUrl: string): Promise<string> {
   }
 
   const result = await sttRes.json() as { text: string };
+  console.log("STT result", result);
   console.log("Transcription complete", { length: result.text.length });
   return result.text;
 }

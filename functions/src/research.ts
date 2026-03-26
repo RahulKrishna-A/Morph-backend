@@ -1,5 +1,5 @@
 import { openai, db, FIRECRAWL_API_KEY } from "./config.js";
-import type { Person } from "./extract.js";
+import type { Person, Task } from "./extract.js";
 import { buildVoiceMessage } from "./voiceMessage.js";
 
 // --- Types ---
@@ -9,9 +9,21 @@ interface SummaryExtraction {
   searchJobs: Array<{
     key: string;
     query: string;
-    type: "web" | "news" | "github" | "research";
+    type: "web" | "news" | "github" | "research" | "local";
     recency: "hour" | "day" | "week" | "any";
     urgent: boolean;
+    location?: string;
+  }>;
+  locationSearches: Array<{
+    key: string;
+    query: string;
+    location: string;
+    taskRef: string;
+  }>;
+  meetingPrep: Array<{
+    key: string;
+    personName: string;
+    queries: string[];
   }>;
   additionalContext: string;
 }
@@ -373,7 +385,8 @@ async function researchSearchJob(
   priorities: string[]
 ): Promise<Array<{ title: string; url: string; content: string }>> {
   const response = await firecrawlSearch(apiKey, job);
-  const sources = dedupeSources(normalizeSources(response)).slice(0, 5);
+  const maxSources = job.limit ?? 5;
+  const sources = dedupeSources(normalizeSources(response)).slice(0, maxSources + 2);
   if (sources.length === 0) {
     return [];
   }
@@ -401,7 +414,8 @@ async function researchSearchJob(
     });
   });
 
-  return refined.slice(0, 3).map((source) => ({
+  const maxResults = Math.min(maxSources, 5);
+  return refined.slice(0, maxResults).map((source) => ({
     title: source.title,
     url: source.url,
     content: source.content,
@@ -421,13 +435,20 @@ export async function buildResearchAndVM(
 
   console.log("Extracting search intent from call summary", { sessionId });
 
+  const tasks = (extractedEntities.tasks ?? []) as Task[];
+  const people = (extractedEntities.people ?? []) as Person[];
+  const locationTasks = tasks.filter((t) => t.needsLocation);
+  const meetPeople = people.filter((p) => p.wantsToMeet);
+
   const extraction = await openai.chat.completions.create({
     model: "gpt-5.1",
     response_format: { type: "json_object" },
     messages: [
       {
         role: "system",
-        content: `You transform a call summary plus the original brain dump into execution priorities and targeted research jobs.
+        content: `You transform a call summary plus the original brain dump into execution priorities, targeted research jobs, location-based searches, and meeting preparation research.
+
+Your mission: EXTRACT MAXIMUM VALUE. Every actionable item should have research behind it. Be AGGRESSIVE with search jobs — more research = better brief for the user.
 
 Return one valid JSON object with exactly this shape:
 {
@@ -436,9 +457,25 @@ Return one valid JSON object with exactly this shape:
     {
       "key": "search_1",
       "query": "specific search query",
-      "type": "web | news | github | research",
+      "type": "web | news | github | research | local",
       "recency": "hour | day | week | any",
-      "urgent": true
+      "urgent": true,
+      "location": "city/area if relevant, otherwise omit"
+    }
+  ],
+  "locationSearches": [
+    {
+      "key": "loc_1",
+      "query": "laptop repair service center near Koramangala Bangalore",
+      "location": "Koramangala, Bangalore",
+      "taskRef": "t1"
+    }
+  ],
+  "meetingPrep": [
+    {
+      "key": "meet_1",
+      "personName": "John Smith",
+      "queries": ["John Smith CEO TechCorp latest news", "TechCorp funding 2024", "John Smith LinkedIn profile"]
     }
   ],
   "additionalContext": "short context that helps downstream response quality"
@@ -451,19 +488,36 @@ Hard output constraints:
 - If ranking is not explicit, infer order from deadline pressure, dependency chains, and consequence of delay.
 - Each priority should be a concise action/outcome statement (roughly 4-16 words).
 
-Search job selection rules:
-- Create searchJobs only for questions that require external information not present in the provided text.
-- Do not create searchJobs for pure execution reminders, self-reflection, or tasks that can be done without lookup.
-- Keep searchJobs between 0 and 6 items.
+Search job rules (BE AGGRESSIVE):
+- Create searchJobs for ANYTHING that benefits from external information.
+- Keep searchJobs between 0 and 10 items. More is better when the user has many action items.
 - Avoid duplicate or overlapping queries.
 - key must be sequential: search_1, search_2, ...
 - query must be practical search-bar text, specific and disambiguated.
+- For location-dependent tasks, include the location in the query.
+- For people mentions, research their latest activity, company, and news.
+- For products/services, research reviews, comparisons, and best options.
+- For meetings/events, research logistics, preparation materials, and context.
 
 Type rules:
+- local: services, shops, restaurants, repair centers, venues — anything tied to a physical location.
 - news: current events, market moves, funding, launches, leadership changes, recent announcements.
 - github: repositories, SDK docs, issues, package compatibility, implementation examples.
 - research: technical papers, benchmarks, deep domain explainers.
 - web: all other general web lookups.
+
+locationSearches rules (CRITICAL):
+- Generate a locationSearch for EVERY task that involves finding a place, service, or physical-world action.
+- The query should be a natural search query including the location: e.g., "best laptop repair near Indiranagar Bangalore", "top rated gyms in HSR Layout".
+- If the user specified a location during the call, USE IT. If not, use any location hints from the dump.
+- Multiple location searches for the same task are fine (e.g., search for "laptop repair" + "keyboard replacement service" for the same task).
+- key must be sequential: loc_1, loc_2, ...
+
+meetingPrep rules (CRITICAL):
+- Generate meetingPrep for EVERY person the user wants to meet.
+- queries should include 2-4 searches that would help the user prepare: the person's latest work, their company news, their social presence, recent achievements or announcements.
+- This helps the user walk into meetings informed and confident.
+- key must be sequential: meet_1, meet_2, ...
 
 Recency rules:
 - hour: breaking updates needed immediately.
@@ -472,20 +526,20 @@ Recency rules:
 - any: timeless/background information.
 
 Urgency rules:
-- urgent=true only if the lookup blocks a near-term decision or same-day action.
+- urgent=true if the lookup blocks a near-term decision or same-day action.
 - urgent=false for background or non-blocking context.
 
 additionalContext rules:
 - 1 to 3 short sentences.
-- Include constraints, user preferences, assumptions, or risks that should influence final messaging.
+- Include constraints, user preferences, locations mentioned, assumptions, or risks.
 - Keep it useful and specific; no generic filler.
 
-If nothing needs external lookup, return "searchJobs": [] and still provide priorities plus additionalContext.
+If nothing needs external lookup, return empty arrays and still provide priorities plus additionalContext.
 Perform a final self-check for parseable JSON and schema compliance before responding.`,
       },
       {
         role: "user",
-        content: `Call summary: ${callSummary}\n\nOriginal dump: ${dumpTranscript}`,
+        content: `Call summary: ${callSummary}\n\nOriginal dump: ${dumpTranscript}\n\nLocation-dependent tasks identified: ${JSON.stringify(locationTasks.map((t) => ({ id: t.id, task: t.cleaned, locationHint: t.locationHint })))}\n\nPeople to meet: ${JSON.stringify(meetPeople.map((p) => ({ id: p.id, name: p.name, company: p.company, context: p.meetingContext })))}`,
       },
     ],
   });
@@ -493,16 +547,13 @@ Perform a final self-check for parseable JSON and schema compliance before respo
   const raw = extraction.choices[0].message.content;
   if (!raw) throw new Error("Empty extraction from call summary");
 
-  const { priorities, searchJobs, additionalContext } =
-    JSON.parse(raw) as SummaryExtraction;
-
-  // People-entity searches (always run)
-  const people = (extractedEntities.people ?? []) as Person[];
-  const peopleSearches: SearchJob[] = people.map((p) => ({
-    key: `person_${p.id}`,
-    query: `${p.name} ${p.company ?? ""} news`.trim(),
-    tbs: "qdr:w",
-  }));
+  const {
+    priorities,
+    searchJobs,
+    locationSearches = [],
+    meetingPrep = [],
+    additionalContext,
+  } = JSON.parse(raw) as SummaryExtraction;
 
   const recencyToTbs: Record<string, string | null> = {
     hour: "qdr:h",
@@ -511,15 +562,50 @@ Perform a final self-check for parseable JSON and schema compliance before respo
     any: null,
   };
 
-  const summarySearches: SearchJob[] = searchJobs.map((j) => ({
-    key: j.key,
-    query: j.query,
-    tbs: recencyToTbs[j.recency] ?? null,
-    limit: 3,
+  // People-entity searches (always run for all mentioned people)
+  const peopleSearches: SearchJob[] = people.map((p) => ({
+    key: `person_${p.id}`,
+    query: `${p.name} ${p.company ?? ""} latest news`.trim(),
+    tbs: "qdr:w",
+    limit: 4,
     scrapeOptions: { formats: ["markdown"] },
   }));
 
-  const allSearchJobs: SearchJob[] = [...peopleSearches, ...summarySearches];
+  // Meeting prep searches — multiple queries per person for deep intel
+  const meetingSearches: SearchJob[] = meetingPrep.flatMap((mp) =>
+    mp.queries.map((q, qi) => ({
+      key: `${mp.key}_q${qi + 1}`,
+      query: q,
+      tbs: "qdr:w" as string | null,
+      limit: 3,
+      scrapeOptions: { formats: ["markdown"] },
+    }))
+  );
+
+  // Location-based searches — find services, places, providers
+  const locationJobs: SearchJob[] = locationSearches.map((ls) => ({
+    key: ls.key,
+    query: ls.query,
+    tbs: null,
+    limit: 5,
+    scrapeOptions: { formats: ["markdown"] },
+  }));
+
+  // Standard search jobs from extraction
+  const summarySearches: SearchJob[] = searchJobs.map((j) => ({
+    key: j.key,
+    query: j.location ? `${j.query} ${j.location}` : j.query,
+    tbs: recencyToTbs[j.recency] ?? null,
+    limit: j.type === "local" ? 5 : 4,
+    scrapeOptions: { formats: ["markdown"] },
+  }));
+
+  const allSearchJobs: SearchJob[] = [
+    ...peopleSearches,
+    ...meetingSearches,
+    ...locationJobs,
+    ...summarySearches,
+  ];
   const researchPlan: ResearchPlanItem[] = allSearchJobs.map((job) => ({
     key: job.key,
     query: job.query,
@@ -565,6 +651,8 @@ Perform a final self-check for parseable JSON and schema compliance before respo
       firecrawlResults,
       researchPlan,
       priorities,
+      locationSearches,
+      meetingPrep,
       status: "building_vm",
     });
 
@@ -578,6 +666,8 @@ Perform a final self-check for parseable JSON and schema compliance before respo
     firecrawlResults,
     researchPlan,
     entities: extractedEntities,
+    locationSearches,
+    meetingPrep,
   });
 }
 
